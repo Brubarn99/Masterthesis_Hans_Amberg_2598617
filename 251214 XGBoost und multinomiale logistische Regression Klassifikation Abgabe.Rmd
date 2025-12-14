@@ -5,7 +5,7 @@ output: html_notebook
 
 Laden aller benötigten Bibliotheken:
 ```{r setup}
-# ---- 1. PACKAGE-SETUP ----
+# ---- PACKAGE-SETUP ----
 # Alle benötigten Bibliotheken laden
 suppressPackageStartupMessages({
   library(haven)          # SPSS-Daten laden
@@ -31,7 +31,7 @@ cat("📦 Alle Pakete erfolgreich geladen!\n\n")
 
 Laden des Datensatzes:
 ```{r data_loading}
-# ---- 2. DATEN LADEN UND ERSTE EXPLORATION ----
+# ---- DATEN LADEN UND ERSTE EXPLORATION ----
 # SPSS-Datei laden
 data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/231121_Merged_CityFixed_MergeFixed.sav")
 
@@ -48,7 +48,7 @@ cat("Bereich:", min(data_raw[[target_var]], na.rm=TRUE), "bis",
 ```
 Konvertierung der Daten und Entfernung aller Zeilen mit fehlender Zielvariable, Überprüfung fehlender Daten:
 ```{r data_cleaning}
-# ---- 3. DATENBEREINIGUNG UND -AUFBEREITUNG ----
+# ---- DATENBEREINIGUNG UND -AUFBEREITUNG ----
 data_clean <- data_raw %>%
   # Entferne Zeilen mit fehlender Zielvariable
   filter(!is.na(.data[[target_var]])) %>%
@@ -86,7 +86,7 @@ if(sum(missing_summary$Missing_Count) > 0) {
 ```
 Definition und Überprüfung der betrachteten Prädiktorvariablen:
 ```{r basic_feature_selection}
-# ---- 4. FEATURE-AUSWAHL MIT INCLUDE-LISTE ----
+# ---- FEATURE-AUSWAHL MIT INCLUDE-LISTE ----
 
 # Definiere ALLE gewünschten Features (ohne Zielvariable)
 include_vars <- c(
@@ -185,7 +185,7 @@ cat("- Gesamt Missing Rate:", round(mean(is.na(data_basic)) * 100, 2), "%\n")
 ```
 Korrelations- und Zielwertanalyse:
 ```{r eda}
-# ---- 5. EXPLORATIVE DATENANALYSE (EDA) ----
+# ---- EXPLORATIVE DATENANALYSE (EDA) ----
 cat("\n📈 Explorative Datenanalyse...\n")
 
 # Verteilung der Zielvariable
@@ -232,7 +232,7 @@ print(head(cor_target, 20))
 ```
 Vorbereiten der Daten für XGBoost - keine Imputation notwendig (Variablennamen können aufgrund von Codeübernahmen von Random Forest irreführend sein)
 ```{r imputing}
-# ---- 6. DATEN FÜR XGBOOST VORBEREITEN ----
+# ---- DATEN FÜR XGBOOST VORBEREITEN ----
 cat("\n🚀 Daten für XGBoost vorbereiten...\n")
 
 data_for_imputation <- as.data.frame(data_basic) %>%
@@ -1074,4 +1074,5 @@ Quellenangaben der verwendeten Packages:
 citation()
 cite_packages()
 ```
+
 
