@@ -1,0 +1,1077 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Laden aller benötigten Bibliotheken:
+```{r setup}
+# ---- 1. PACKAGE-SETUP ----
+# Alle benötigten Bibliotheken laden
+suppressPackageStartupMessages({
+  library(haven)          # SPSS-Daten laden
+  library(tidyverse)      # Datenmanipulation und ggplot2
+  library(randomForest)   # Random Forest Modell
+  library(caret)          # Machine Learning Framework
+  library(corrplot)       # Korrelationsmatrizen
+  library(patchwork)
+  library(reshape2)
+  library(report)
+  library(nnet)           # für das multinomiale Modell
+  library(glmnet)         # für das multinomiale Modell 
+  library(mltools)
+  
+  
+  # SHAP-bezogene Pakete
+  library(shapr)          # SHAP-Werte für Erklärbarkeit
+  library(shapviz)        # Zur Visualisierung von Shap
+})
+
+cat("📦 Alle Pakete erfolgreich geladen!\n\n")
+```
+
+Laden des Datensatzes:
+```{r data_loading}
+# ---- 2. DATEN LADEN UND ERSTE EXPLORATION ----
+# SPSS-Datei laden
+data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/231121_Merged_CityFixed_MergeFixed.sav")
+
+cat("📊 Datensatz-Überblick:\n")
+cat(paste("Dimensionen:", nrow(data_raw), "Zeilen x", ncol(data_raw), "Spalten\n"))
+
+# Zielvariable definieren
+target_var <- "q5_10"  # Zielvariable
+
+cat("\n🎯 Zielvariable Analyse:\n")
+print(table(data_raw[[target_var]], useNA = "ifany"))
+cat("Bereich:", min(data_raw[[target_var]], na.rm=TRUE), "bis", 
+    max(data_raw[[target_var]], na.rm=TRUE), "\n")
+```
+Konvertierung der Daten und Entfernung aller Zeilen mit fehlender Zielvariable, Überprüfung fehlender Daten:
+```{r data_cleaning}
+# ---- 3. DATENBEREINIGUNG UND -AUFBEREITUNG ----
+data_clean <- data_raw %>%
+  # Entferne Zeilen mit fehlender Zielvariable
+  filter(!is.na(.data[[target_var]])) %>%
+  # Konvertiere SPSS Labels zu numerischen Werten (nur für nicht-character Variablen)
+  mutate(across(where(is.labelled) & !where(is.character), ~ as.numeric(.x))) %>%
+  # Für character-labelled Variablen: Entferne Labels und behalte als character
+  mutate(across(where(is.labelled) & where(is.character), ~ as.character(.x)))
+
+cat("\n🧹 Nach Bereinigung:", nrow(data_clean), "Zeilen verbleibend\n")
+
+# Entferne Spalten  mit nur NAs
+data_clean <- data_clean[, colSums(is.na(data_clean)) < nrow(data_clean)]
+
+# Missing Values Analyse
+missing_summary <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Percent = round((Missing_Count / nrow(data_clean)) * 100, 2)) %>%
+  arrange(desc(Missing_Count))
+
+# Visualisierung der Missing Values (nur wenn welche vorhanden)
+if(sum(missing_summary$Missing_Count) > 0) {
+  p_missing <- missing_summary %>%
+    head(20) %>%
+    filter(Missing_Count > 0) %>%
+    ggplot(aes(x = reorder(Variable, Missing_Count), y = Missing_Percent)) +
+    geom_col(fill = "coral") +
+    coord_flip() +
+    labs(title = "Missing Values Analyse (Top 20)",
+         x = "Variable", y = "Fehlende Werte (%)") +
+    theme_minimal()
+  
+  print(p_missing)
+}
+```
+Definition und Überprüfung der betrachteten Prädiktorvariablen:
+```{r basic_feature_selection}
+# ---- 4. FEATURE-AUSWAHL MIT INCLUDE-LISTE ----
+
+# Definiere ALLE gewünschten Features (ohne Zielvariable)
+include_vars <- c(
+  # Ökologische Faktoren:
+  "a1l1_333", "a1l2_334", "a1l3_335", "a1l4_336", "a1l5_337",
+  
+  # Soziale Faktoren:
+  "a2l1_338", "a2l2_339", "a2l3_340", "a2l4_341", "a2l5_342",
+  
+  # Ökonomische Faktoren:
+  "a3l1_343", "a3l2_344", "a3l3_345", "a3l4_346", "a3l5_347", "a3l6_348",
+  
+  # Demografische Variablen
+  "Age", "FamilySt", "FamilyPrsNr", 
+  "FamilyChldNr_SQ002", "FamilyChldNr_SQ003", "FamilyChldNr_SQ004", 
+  "FamilyChldNr_SQ005", "FamilyChldNr_SQ006", "FamilyChldNr_SQ007",
+  
+  # Bildung & Beruf
+  "EduSD", "Occup", "Office",
+  
+  # Big Five Persönlichkeit
+  "SklBig5_G1", "SklBig5_E1", "SklBig5_O1", "SklBig5_N1", "SklBig5_V1",
+  "SklBig5_E2", "SklBig5_N2", "SklBig5_G2", "SklBig5_V2", "SklBig5_O2",
+  
+  # Einkommen & Ausgaben
+  "NetIncome", "NetIncomeFree_ResiRnt", "NetIncomeFree_consumption", 
+  "NetIncomeFree_savings",
+  
+  # Ausgabenkategorien
+  "Spendings_NonFood", "Spendings_Sport", "Spendings_BodyCare", 
+  "Spendings_Leissure", "Spendings_VocTrng", "Spendings_PrvtTrng",
+  "Spendings_EDU", "Spendings_Gastro", "Spendings_Culture"
+)
+
+cat("\n🎯 Feature-Auswahl mit Include-Liste:\n")
+cat("Gewünschte Features:", length(include_vars), "\n\n")
+
+# PRÜFUNG 1: Welche Variablen existieren im Datensatz?
+existing_vars <- intersect(include_vars, names(data_clean))
+missing_vars <- setdiff(include_vars, names(data_clean))
+
+if(length(missing_vars) > 0) {
+  cat("\n⚠️ Fehlende Features (", length(missing_vars), "):\n", sep="")
+  print(missing_vars)
+  cat("\nDiese werden ignoriert.\n")
+}
+
+# PRÜFUNG 2: Sind alle numerisch?
+non_numeric <- existing_vars[!sapply(data_clean[existing_vars], is.numeric)]
+if(length(non_numeric) > 0) {
+  cat("\n⚠️ Nicht-numerische Features (", length(non_numeric), "):\n", sep="")
+  print(non_numeric)
+  cat("Diese werden entfernt.\n")
+  existing_vars <- setdiff(existing_vars, non_numeric)
+}
+
+# Finalisiere Feature-Liste
+feature_cols <- existing_vars
+cat("\n✅ Finale Feature-Anzahl:", length(feature_cols), "\n")
+
+# Erstelle Basis-Datensatz (Features + Zielvariable)
+data_basic <- data_clean %>%
+  select(all_of(c(feature_cols, target_var)))
+
+# PRÜFUNG 3: Entferne Spalten mit Standardabweichung = 0
+zero_sd_cols <- names(which(apply(data_basic[feature_cols], 2, 
+                                   function(x) sd(x, na.rm = TRUE)) == 0))
+if(length(zero_sd_cols) > 0) {
+  cat("\n⚠️ Entferne", length(zero_sd_cols), "Features mit SD=0:\n")
+  print(zero_sd_cols)
+  feature_cols <- setdiff(feature_cols, zero_sd_cols)
+  data_basic <- data_basic %>% select(all_of(c(feature_cols, target_var)))
+}
+
+# PRÜFUNG 4: Warnung bei hohen Missing Values
+missing_pct <- colMeans(is.na(data_basic[feature_cols])) * 100
+high_missing <- names(missing_pct[missing_pct > 50])
+
+if(length(high_missing) > 0) {
+  cat("\n⚠️ Features mit >50% Missing Values (", length(high_missing), "):\n", sep="")
+  high_missing_df <- data.frame(
+    Feature = high_missing,
+    Missing_Pct = round(missing_pct[high_missing], 1)
+  )
+  print(high_missing_df)
+}
+
+# AUSGABE: Zusammenfassung
+cat("\n" , rep("=", 70), "\n", sep="")
+cat("FEATURE-AUSWAHL ABGESCHLOSSEN\n")
+cat(rep("=", 70), "\n\n", sep="")
+cat("Datensatz-Dimensionen:", nrow(data_basic), "Zeilen x", ncol(data_basic), "Spalten\n")
+cat("- Features:", length(feature_cols), "\n")
+cat("- Zielvariable: 1 (", target_var, ")\n", sep="")
+cat("- Gesamt Missing Rate:", round(mean(is.na(data_basic)) * 100, 2), "%\n")
+```
+Korrelations- und Zielwertanalyse:
+```{r eda}
+# ---- 5. EXPLORATIVE DATENANALYSE (EDA) ----
+cat("\n📈 Explorative Datenanalyse...\n")
+
+# Verteilung der Zielvariable
+p_target <- ggplot(data_basic, aes_string(x = target_var)) +
+  geom_histogram(bins = 7, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_density(aes(y = ..count..), alpha = 0.3, fill = "red") +
+  labs(title = paste("Verteilung der Zielvariable:", target_var),
+       x = "Likert-Skala (1-7)", y = "Häufigkeit") +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:7)
+
+print(p_target)
+
+# Einfache Imputation mit Median für Korrelationsanalyse
+data_for_corr <- data_basic
+for(col in feature_cols) {
+  if(sum(is.na(data_for_corr[[col]])) > 0) {
+    data_for_corr[[col]][is.na(data_for_corr[[col]])] <- median(data_for_corr[[col]], na.rm = TRUE)
+  }
+}
+
+# Korrelationsanalyse für Top Features
+feature_data <- data_for_corr %>%
+  select(-all_of(target_var))
+
+# Berechne Korrelationen zur Zielvariable
+correlations <- cor(feature_data, data_for_corr[[target_var]], use = "complete.obs")
+correlations <- abs(as.vector(correlations))
+names(correlations) <- colnames(feature_data) 
+correlations <- sort(correlations, decreasing = TRUE)
+
+# Top Features für Korrelationsmatrix
+top_features <- names(correlations)[1:min(20, length(correlations))]
+
+# Korrelationsmatrix plotten
+cor_matrix <- cor(data_for_corr[c(top_features, target_var)], use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.8, tl.col = "black", title = "Korrelationsmatrix (Top Features)")
+
+# Ausgabe der Korrelationen mit Zielvariable
+cor_target <- cor_matrix[target_var, ] %>% sort(decreasing = TRUE)
+cat("\nTop 10 Korrelationen mit Zielvariable:\n")
+print(head(cor_target, 20))
+```
+Vorbereiten der Daten für XGBoost - keine Imputation notwendig (Variablennamen können aufgrund von Codeübernahmen von Random Forest irreführend sein)
+```{r imputing}
+# ---- 6. DATEN FÜR XGBOOST VORBEREITEN ----
+cat("\n🚀 Daten für XGBoost vorbereiten...\n")
+
+data_for_imputation <- as.data.frame(data_basic) %>%
+  select(all_of(feature_cols), all_of(target_var))
+
+# Prüfe Missing Values
+missing_count <- sum(is.na(data_for_imputation))
+cat("Fehlende Werte im Datensatz:", missing_count, "\n")
+
+# KEINE Imputation - XGBoost kann mit Missing Values umgehen
+data_imputed <- data_for_imputation
+
+# Train-Test Split
+set.seed(42)
+trainIndex <- createDataPartition(data_imputed[[target_var]], p = 0.7, list = FALSE)
+train_basic <- data_imputed[trainIndex, ]
+test_basic <- data_imputed[-trainIndex, ]
+
+cat("Training:", nrow(train_basic), "Beobachtungen\n")
+cat("Test:", nrow(test_basic), "Beobachtungen\n")
+```
+
+XGBoost-Training und Hyperparameterbestimmung
+```{r initial_xgb_training}
+# XGBoost benötigt numerische Matrix
+X_train_matrix <- as.matrix(train_basic[feature_cols])
+y_train_vector <- train_basic[[target_var]]
+
+# Parameter-Grid für XGBoost (Klassifikation)
+xgb_grid <- expand.grid(
+  nrounds = c(100, 300, 500, 750, 1000), # 500
+  max_depth = c(1, 3, 6, 9), # 6
+  eta = c(0.01, 0.1, 0.3), # 0.01
+  gamma = c(0, 0.1, 0.5), # 0
+  colsample_bytree = c(0.6, 0.8, 1.0), # 0.8
+  min_child_weight = c(1,2,3), # 1
+  subsample = c(0.7, 0.8, 1.0) # 0.7
+)
+
+# Cross-Validation Setup
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE
+)
+
+# Hyperparameter-Tuning
+xgb_tuned <- train(
+  x = X_train_matrix,
+  y = as.factor(y_train_vector),  # Als Faktor für Klassifikation
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = xgb_grid,
+  metric = "Accuracy"  # Statt RMSE
+)
+
+print(xgb_tuned$bestTune)
+xgb_model <- xgb_tuned$finalModel
+
+cat("✅ XGBoost Modell erfolgreich trainiert.\n")
+```
+Anpassen der Labels für spätere Visualisierungen:
+```{r}
+# ==== LABELS FÜR VISUALISIERUNG ====
+variable_labels <- c(
+  "a1l1_333" = "Ökologisch: Smarte Energieversorgung",
+  "a1l2_334" = "Ökologisch: Vielfältige Begrünung",
+  "a1l3_335" = "Ökologisch: Zirkuläre Wirtschaft",
+  "a1l4_336" = "Ökologisch: Emissionsarmes Quartier",
+  "a1l5_337" = "Ökologisch: Versickerungsflächen",
+  "a2l1_338" = "Sozial: Multikulturelle Entwicklung",
+  "a2l2_339" = "Sozial: Sicherheitsempfinden",
+  "a2l3_340" = "Sozial: Niedrige Einkommensklassen",
+  "a2l4_341" = "Sozial: Generationenübergreifend",
+  "a2l5_342" = "Sozial: Mitbestimmung",
+  "a3l1_343" = "Ökonomisch: Lokale Unternehmen",
+  "a3l2_344" = "Ökonomisch: Internationale Unternehmen",
+  "a3l3_345" = "Ökonomisch: Start-Ups & Innovation",
+  "a3l4_346" = "Ökonomisch: Bildung",
+  "a3l5_347" = "Ökonomisch: Verkehrsinfrastruktur",
+  "a3l6_348" = "Ökonomisch: Kunst & Kultur"
+)
+
+rename_features <- function(feature_names) {
+  sapply(feature_names, function(x) {
+    if(x %in% names(variable_labels)) {
+      return(variable_labels[x])
+    } else {
+      return(x)
+    }
+  }, USE.NAMES = FALSE)
+}
+
+```
+ 
+Berechnung der Gütemaße des XGBoost-Modells: 
+```{r}
+# ----- Gütemaße -----
+X_test_matrix <- as.matrix(test_basic[feature_cols])
+
+# Vorhersage gibt Matrix mit Wahrscheinlichkeiten zurück
+predict <- predict(xgb_model, X_test_matrix, reshape = TRUE)
+
+# Extrahiere die Klasse mit höchster Wahrscheinlichkeit
+predict_class <- max.col(predict)  # Gibt Spaltenindex (1-7) zurück
+
+# Konvertiere zu Faktoren
+y_true_xgb <- factor(test_basic[[target_var]], levels = 1:7)
+y_pred_xgb <- factor(predict_class, levels = 1:7)
+
+# Confusion Matrix
+conf_matrix_xgb <- confusionMatrix(y_pred_xgb, y_true_xgb)
+print(conf_matrix_xgb$table)
+
+accuracy_xgb <- mean(predict_class == test_basic[[target_var]])
+cat("Accuracy:", round(accuracy_xgb, 4), "\n")
+
+# Plot
+plot(test_basic[[target_var]], predict_class,
+    xlab = "Tatsächliche Klassen",
+    ylab = "Vorhergesagte Klassen",
+    main = "XGBoost Klassifikation: Vorhersage vs. Realität")
+abline(0, 1, col = "red", lwd = 2)
+
+# Berechne MCC für XGBoost
+mcc_xgb <- mcc(preds = y_pred_xgb, actuals = y_true_xgb)
+cat("\nMCC des XGBoost Modells:", round(mcc_xgb, 4), "\n")
+
+# Balanced Accuracy
+sensitivities_xgb <- conf_matrix_xgb$byClass[, "Sensitivity"]
+ba_xgb <- mean(sensitivities_xgb, na.rm = TRUE)
+cat("\nBalanced Accuracy des XGBoost Modells:", round(ba_xgb, 4), "\n")
+
+# Berechne F1-Score pro Klasse
+f1_scores_xgb <- conf_matrix_xgb$byClass[, "F1"]
+# Macro-averaged F1-Score (Durchschnitt über alle Klassen)
+f1_macro_xgb <- mean(f1_scores_xgb, na.rm = TRUE)
+cat("Macro F1-Score des XGBoost Modells:", round(f1_macro_xgb, 4), "\n\n")
+```
+
+
+Berechnung der multinomialen logistischen Regression, inkl. Imputation der fehlenden Werte. Anschließende Berechnung der Gütemaße des Modells:
+```{r}
+### Multinomiale Logistische Regression ###
+train_imputed <- train_basic[feature_cols]
+train_imputed[is.na(train_imputed)] <- 4
+
+multinom_model <- multinom(as.factor(train_basic[[target_var]]) ~ .,
+                          data = train_imputed)
+
+# Test-Daten auch imputiert
+test_imputed <- test_basic[feature_cols]
+test_imputed[is.na(test_imputed)] <- 4
+
+predict_multinom <- predict(multinom_model, test_imputed)
+accuracy_multinom_imputed <- mean(predict_multinom == as.factor(test_basic[[target_var]]))
+cat("Accuracy des multinomialen Modells:", round(accuracy_multinom_imputed, 4), "\n")
+
+# Konvertiere zu Faktoren mit gleichen Levels
+y_true <- factor(test_basic[[target_var]], levels = 1:7)  # Korrektur: test_basic statt test_imputed
+y_pred <- factor(predict_multinom, levels = 1:7)
+
+# Berechne MCC
+mcc_multinom <- mcc(preds = y_pred, actuals = y_true)
+cat("MCC des multinomialen Modells:", round(mcc_multinom, 4), "\n\n")
+
+# Erstelle Confusion Matrix
+conf_matrix_multinom <- confusionMatrix(y_pred, y_true)
+print(conf_matrix_multinom$table)
+
+# Extrahiere Sensitivity (Recall) pro Klasse
+sensitivities <- conf_matrix_multinom$byClass[, "Sensitivity"]
+
+# Balanced Accuracy = Durchschnitt der Sensitivities
+ba_multinom <- mean(sensitivities, na.rm = TRUE)
+cat("Balanced Accuracy des multinominalen Modells:", round(ba_multinom, 4), "\n\n")
+
+# F1-Score für imputiertes multinomiales Modell
+f1_scores_multinom <- conf_matrix_multinom$byClass[, "F1"]
+# Macro-averaged F1-Score
+f1_macro_multinom <- mean(f1_scores_multinom, na.rm = TRUE)
+cat("Macro F1-Score des multinomialen Modells (imputiert):", round(f1_macro_multinom, 4), "\n\n")
+```
+
+Berechnung und Visualisierung der einflussreichsten Variablen der multinomialen logistischen Regression
+```{r}
+# ==== TOP 10 VARIABLEN MULTINOMIALE REGRESSION ====
+cat("\n=== Top 10 einflussreichste Variablen (Multinomiale Regression) ===\n")
+
+coef_multinom <- summary(multinom_model)$coefficients
+
+if(is.matrix(coef_multinom)) {
+  avg_abs_coef <- colMeans(abs(coef_multinom))
+} else {
+  avg_abs_coef <- abs(coef_multinom)
+}
+
+avg_abs_coef <- avg_abs_coef[names(avg_abs_coef) != "(Intercept)"]
+top_10_multinom <- sort(avg_abs_coef, decreasing = TRUE)[1:10]
+
+top_10_df <- data.frame(
+  Rang = 1:10,
+  Variable = names(top_10_multinom),
+  Avg_Abs_Coefficient = round(as.numeric(top_10_multinom), 4)
+)
+
+print(top_10_df)
+
+# Detaillierte Koeffizienten pro Klasse
+cat("\n=== Koeffizienten der Top 10 Features pro Klasse ===\n")
+coef_detail <- coef_multinom[, names(top_10_multinom)]
+print(round(coef_detail, 4))
+
+# ==== MULTINOMIALE REGRESSION: KOEFFIZIENTEN UND SIGNIFIKANZ ====
+
+# Zusammenfassung des Modells
+summary_multinom <- summary(multinom_model)
+
+# Koeffizienten (Beta-Werte)
+coef_multinom <- summary_multinom$coefficients
+cat("\n=== KOEFFIZIENTEN (Beta) DES MULTINOMIALEN MODELLS ===\n")
+print(round(coef_multinom, 4))
+
+# Standardfehler
+se_multinom <- summary_multinom$standard.errors
+
+# Z-Werte berechnen
+z_values <- coef_multinom / se_multinom
+
+# P-Werte berechnen (zweiseitiger Test)
+p_values <- 2 * (1 - pnorm(abs(z_values)))
+
+# Ausgabe für jede Klasse (relativ zu Referenzklasse 1)
+for(class_i in 1:nrow(coef_multinom)) {
+  cat("\n", rep("=", 70), "\n", sep="")
+  cat("KLASSE", class_i + 1, "vs. Klasse 1 (Referenz)\n")
+  cat(rep("=", 70), "\n\n", sep="")
+  
+  # Erstelle Ergebnistabelle
+  results_table <- data.frame(
+    Variable = colnames(coef_multinom),
+    Beta = round(coef_multinom[class_i, ], 4),
+    SE = round(se_multinom[class_i, ], 4),
+    Z = round(z_values[class_i, ], 4),
+    P_Value = round(p_values[class_i, ], 4),
+    Signifikanz = ifelse(p_values[class_i, ] < 0.001, "***",
+                  ifelse(p_values[class_i, ] < 0.01, "**",
+                  ifelse(p_values[class_i, ] < 0.05, "*",
+                  ifelse(p_values[class_i, ] < 0.1, ".", ""))))
+  )
+  
+  # Sortiere nach absolutem Beta-Wert (ohne Intercept)
+  results_table_sorted <- results_table[order(-abs(results_table$Beta)), ]
+  
+  print(results_table_sorted)
+  
+  cat("\nSignifikanzcodes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1\n")
+}
+```
+
+Verteilung der Vorhersagen XGBoost, OLS und im Original:
+```{r}
+# ==== HISTOGRAMM: VORHERSAGEVERTEILUNG ====
+
+# Vorhersagen berechnen
+xgb_predictions <- predict_class  # Bereits vorhanden
+multinom_predictions <- as.numeric(as.character(predict_multinom))
+
+# Tatsächliche Werte
+actual_values <- test_basic[[target_var]]
+
+# Erstelle DataFrame für Plotting
+pred_df <- data.frame(
+  Actual = actual_values,
+  XGBoost = xgb_predictions,
+  Multinomial = multinom_predictions
+)
+
+# Reshape für ggplot
+library(tidyr)
+pred_long <- pred_df %>%
+  pivot_longer(cols = c(Actual, XGBoost, Multinomial),
+               names_to = "Modell",
+               values_to = "Klasse") %>%
+  mutate(Modell = ifelse(Modell == "Actual", "Tatsächliche Werte", Modell),
+         Modell = factor(Modell, levels = c("Tatsächliche Werte", "Multinomial", "XGBoost")))
+
+# Histogramm mit Facets
+p_hist <- ggplot(pred_long, aes(x = Klasse, fill = Modell)) +
+  geom_histogram(binwidth = 1, alpha = 0.7, position = "identity", 
+                 color = "black", breaks = 0.5:7.5) +
+  facet_wrap(~Modell, ncol = 1) +
+  scale_x_continuous(breaks = 1:7) +
+  scale_fill_manual(values = c("Tatsächliche Werte" = "gray50", 
+                               "XGBoost" = "steelblue", 
+                               "Multinomial" = "coral")) +
+  labs(title = "Verteilung der Zielvariable",
+       x = "Klasse (1-7)",
+       y = "Häufigkeit") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 12, face = "bold"))
+
+print(p_hist)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,
+                        "/prediction_distribution_", target_var, ".png"),
+       plot = p_hist, width = 8, height = 10, dpi = 300, bg = "white")
+
+# Numerischer Vergleich
+cat("\n=== Verteilungsvergleich ===\n")
+cat("\nTatsächliche Verteilung:\n")
+print(table(actual_values))
+cat("\nXGBoost Vorhersagen:\n")
+print(table(xgb_predictions))
+cat("\nMultinomial Vorhersagen:\n")
+print(table(multinom_predictions))
+```
+
+Signifikanteste Features laut multinomialer logistischer Regression:
+```{r}
+# ==== HEATMAP MIT SIGNIFIKANZSTERNEN ====
+
+# Berechne P-Werte (falls noch nicht vorhanden)
+summary_multinom <- summary(multinom_model)
+coef_multinom <- summary_multinom$coefficients
+se_multinom <- summary_multinom$standard.errors
+z_values <- coef_multinom / se_multinom
+p_values <- 2 * (1 - pnorm(abs(z_values)))
+
+# Erstelle Signifikanz-Matrix
+signif_matrix <- matrix("", nrow = nrow(coef_multinom), ncol = ncol(coef_multinom))
+signif_matrix[p_values < 0.001] <- "***"
+signif_matrix[p_values >= 0.001 & p_values < 0.01] <- "**"
+signif_matrix[p_values >= 0.01 & p_values < 0.05] <- "*"
+signif_matrix[p_values >= 0.05 & p_values < 0.1] <- "."
+
+colnames(signif_matrix) <- colnames(coef_multinom)
+rownames(signif_matrix) <- rownames(coef_multinom)
+
+# Top 10 Features identifizieren
+if(!exists("top_10_multinom")) {
+  if(is.matrix(coef_multinom)) {
+    max_abs_coef <- apply(abs(coef_multinom), 2, max)
+  } else {
+    max_abs_coef <- abs(coef_multinom)
+  }
+  max_abs_coef <- max_abs_coef[names(max_abs_coef) != "(Intercept)"]
+  top_10_multinom <- sort(max_abs_coef, decreasing = TRUE)[1:10]
+}
+
+# Filtere Top 10 Features
+coef_top10 <- coef_multinom[, names(top_10_multinom)]
+signif_top10 <- signif_matrix[, names(top_10_multinom)]
+
+# Füge Labels hinzu
+colnames(coef_top10) <- rename_features(colnames(coef_top10))
+colnames(signif_top10) <- rename_features(colnames(signif_top10))
+rownames(coef_top10) <- paste("Klasse", 2:(nrow(coef_top10)+1))
+
+# Erstelle Long-Format
+coef_long <- melt(coef_top10)
+signif_long <- melt(signif_top10)
+
+plot_data <- data.frame(
+  Klasse = coef_long$Var1,
+  Feature = coef_long$Var2,
+  Beta = coef_long$value,
+  Signif = signif_long$value
+)
+
+p_heatmap_signif <- ggplot(plot_data, aes(x = Klasse, y = Feature, fill = Beta)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = paste0(round(Beta, 2), "\n", Signif)), 
+            size = 3, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0,
+                       limits = c(-max(abs(plot_data$Beta)), 
+                                 max(abs(plot_data$Beta)))) +
+  scale_y_discrete(limits = rev(levels(factor(plot_data$Feature)))) +
+  labs(title = "Multinomiale Regression: Beta-Koeffizienten (Top 10)",
+       subtitle = "Signifikanz: *** p<0.001, ** p<0.01, * p<0.05, . p<0.1",
+       x = "Klasse im Verhältnis zu Referenzklasse 1", 
+       y = "",
+       fill = "Beta") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 10, color = "gray40"),
+        legend.position = "right")
+
+print(p_heatmap_signif)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,
+                        "/multinom_heatmap_signif_", target_var, ".png"),
+       plot = p_heatmap_signif, width = 10, height = 8, dpi = 300, bg = "white")
+
+cat("\n✅ Heatmap mit Beta + Signifikanz  erstellt!\n")
+# Berechne minimalen p-Wert pro Feature über alle Klassen
+if(is.matrix(p_values)) {
+  min_p_values <- apply(p_values, 2, min)
+} else {
+  min_p_values <- p_values
+}
+
+# Entferne Intercept
+min_p_values <- min_p_values[names(min_p_values) != "(Intercept)"]
+
+# Sortiere nach niedrigstem p-Wert (höchste Signifikanz)
+top_10_significant <- sort(min_p_values, decreasing = FALSE)[1:10]
+
+cat("\n=== Top 10 Features nach Signifikanz ===\n")
+top_10_df <- data.frame(
+  Rang = 1:10,
+  Feature = names(top_10_significant),
+  Min_P_Value = round(as.numeric(top_10_significant), 6),
+  Signifikanz = ifelse(top_10_significant < 0.001, "***",
+                ifelse(top_10_significant < 0.01, "**",
+                ifelse(top_10_significant < 0.05, "*",
+                ifelse(top_10_significant < 0.1, ".", ""))))
+)
+print(top_10_df)
+
+# Filtere Top 10 Features
+coef_top10 <- coef_multinom[, names(top_10_significant)]
+signif_top10 <- signif_matrix[, names(top_10_significant)]
+
+# Füge Labels hinzu
+colnames(coef_top10) <- rename_features(colnames(coef_top10))
+colnames(signif_top10) <- rename_features(colnames(signif_top10))
+rownames(coef_top10) <- paste("Klasse", 2:(nrow(coef_top10)+1))
+
+# Erstelle Long-Format
+coef_long <- melt(coef_top10)
+signif_long <- melt(signif_top10)
+
+plot_data <- data.frame(
+  Klasse = coef_long$Var1,
+  Feature = coef_long$Var2,
+  Beta = coef_long$value,
+  Signif = signif_long$value
+)
+
+# Sortiere Features nach Signifikanz (wichtigste oben)
+feature_order <- rename_features(names(top_10_significant))
+plot_data$Feature <- factor(plot_data$Feature, levels = rev(feature_order))
+
+p_heatmap_signif <- ggplot(plot_data, aes(x = Klasse, y = Feature, fill = Beta)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = paste0(round(Beta, 2), "\n", Signif)), 
+            size = 3, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0,
+                       limits = c(-max(abs(plot_data$Beta)), 
+                                 max(abs(plot_data$Beta)))) +
+  labs(title = "Multinomiale Regression: Beta-Koeffizienten (Top 10 nach Signifikanz)",
+       subtitle = "Sortiert nach niedrigstem p-Wert | Signifikanz: *** p<0.001, ** p<0.01, * p<0.05, . p<0.1",
+       x = "Klasse im Verhältnis zu Referenzklasse 1", 
+       y = "",
+       fill = "Beta") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 10, color = "gray40"),
+        legend.position = "right")
+
+print(p_heatmap_signif)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,
+                        "/multinom_heatmap_signif_top10_", target_var, ".png"),
+       plot = p_heatmap_signif, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+
+Berechnung des Shapley-Wertes für alle Klassen des XGBoost-Modells:
+```{r}
+# ==== ANGEPASSTE VISUALISIERUNG FÜR ALLE KLASSEN ====
+
+# Stelle sicher, dass X_train und X_test die gleichen Spalten haben
+X_train <- as.data.frame(train_basic[feature_cols])
+X_test <- as.data.frame(test_basic[feature_cols])
+y_train <- as.data.frame(train_basic[[target_var]])
+
+# Konvertiere zu Matrix für XGBoost
+X_train_matrix <- as.matrix(X_train)
+X_test_matrix <- as.matrix(X_test)
+
+# Berechne mittlere absolute SHAP-Werte pro Feature und Klasse
+n_classes <- 7  # Anzahl der Klassen (1-7 Likert-Skala)
+
+importance_matrix <- matrix(NA, nrow = length(feature_cols), ncol = n_classes)
+rownames(importance_matrix) <- feature_cols
+colnames(importance_matrix) <- paste0("Klasse_", 1:n_classes)
+n_samples <- nrow(X_test)
+
+# SHAP für alle Klassen berechnen
+shap_all_classes <- list()
+shap_viz_all <- list()
+
+cat("Berechne SHAP-Werte für alle Klassen...\n")
+
+for(class_i in 1:n_classes) {
+  cat("Klasse", class_i, "...\n")
+  shap_matrix <- matrix(NA, nrow = n_samples, ncol = length(feature_cols))
+  
+  for(i in 1:n_samples) {
+    pred_wrapper <- function(object, newdata) {
+      newdata_matrix <- as.matrix(newdata)
+      pred <- predict(object, newdata_matrix, reshape = TRUE)
+      return(pred[, class_i])
+    }
+    
+    shap_values_i <- explain(
+      object = xgb_model,
+      X = X_train_matrix,
+      pred_wrapper = pred_wrapper,
+      nsim = 20, # je höher, desto besser. Dauert aber lange zum Rechnen
+      newdata = X_test_matrix[i, , drop = FALSE]
+    )
+    
+    shap_matrix[i, ] <- shap_values_i
+  }
+  
+  colnames(shap_matrix) <- feature_cols
+  shap_all_classes[[class_i]] <- shap_matrix
+  shap_viz_all[[class_i]] <- shapviz(shap_matrix, X = X_test[1:n_samples, ])
+}
+```
+
+Genauigkeitscheck der Shapley-Werte:
+```{r}
+# ==== GENAUIGKEITSCHECK ====
+library (patchwork)
+cat("\n=== SHAP Genauigkeitscheck für alle Klassen ===\n")
+
+
+rmse_all_classes <- numeric(n_classes)
+plot_list <- list()
+
+for(class_i in 1:n_classes) {
+  # Baseline für diese Klasse
+  baseline <- mean(predict(xgb_model, X_train_matrix, reshape = TRUE)[, class_i])
+  
+  # SHAP-Summen + Baseline
+  shap_sums <- rowSums(shap_all_classes[[class_i]]) + baseline
+  
+  # Tatsächliche Vorhersagen für diese Klasse
+  actual_predictions <- predict(xgb_model, X_test_matrix[1:n_samples,], 
+                               reshape = TRUE)[, class_i]
+  
+  # RMSE berechnen
+  rmse_all_classes[class_i] <- sqrt(mean((actual_predictions - shap_sums)^2))
+  
+  # Plot erstellen
+  plot_df <- data.frame(
+    Actual = actual_predictions,
+    SHAP_Sum = shap_sums
+  )
+  
+  plot_list[[class_i]] <- ggplot(plot_df, aes(x = Actual, y = SHAP_Sum)) +
+    geom_point(alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    labs(title = paste("Klasse", class_i, "- RMSE:", round(rmse_all_classes[class_i], 4)),
+         x = "Modell", y = "SHAP") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10))
+}
+
+# Kombiniere alle 7 Plots
+combined <- (plot_list[[1]] | plot_list[[2]] | plot_list[[3]]) /
+            (plot_list[[4]] | plot_list[[5]] | plot_list[[6]]) /
+            (plot_list[[7]] | plot_spacer() | plot_spacer())
+
+combined <- combined + plot_annotation(
+  title = "SHAP Genauigkeit für alle Klassen",
+  subtitle = paste("Durchschnittlicher RMSE:", round(mean(rmse_all_classes), 4))
+)
+
+print(combined)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,
+                        "/SHAP_Genauigkeit_alle_Klassen_", target_var, ".png"),
+       plot = combined, width = 12, height = 12, dpi = 300, bg = "white")
+```
+
+Berechnen der Feature Importance Matrix:
+```{r}
+cat("\n=== Berechne Feature Importance Matrix ===\n")
+
+# Berechne mittlere absolute SHAP-Werte pro Feature und Klasse
+for(class_i in 1:n_classes) {
+  importance_matrix[, class_i] <- apply(abs(shap_all_classes[[class_i]]), 2, mean)
+}
+
+cat("✅ Importance Matrix erfolgreich berechnet!\n")
+cat("Dimensionen:", nrow(importance_matrix), "Features x", ncol(importance_matrix), "Klassen\n\n")
+```
+
+Berechnung und Visualisierung der wichtigsten Features für das XGBoost-Modell und die multinomiale logistische Regression:
+```{r}
+# ==== 1. HEATMAP MIT LABELS ====
+# Berechne importance_matrix falls noch nicht vorhanden
+if(!exists("importance_matrix")) {
+  importance_matrix <- matrix(NA, nrow = length(feature_cols), ncol = n_classes)
+  rownames(importance_matrix) <- feature_cols
+  colnames(importance_matrix) <- paste0("Klasse_", 1:n_classes)
+  
+  for(class_i in 1:n_classes) {
+    importance_matrix[, class_i] <- apply(abs(shap_all_classes[[class_i]]), 2, mean)
+  }
+}
+
+# Top Features identifizieren
+mean_importance <- rowMeans(importance_matrix)
+top_features <- names(sort(mean_importance, decreasing = TRUE)[1:15])
+
+# Erstelle neue Matrix mit Labels als Zeilennamen
+importance_for_plot <- importance_matrix[top_features, ]
+rownames(importance_for_plot) <- rename_features(rownames(importance_for_plot))
+
+pheatmap(importance_for_plot,
+         main = "Feature Importance Heatmap\n(Top 15 Features über alle Klassen)",
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         scale = "row",
+         color = colorRampPalette(c("white", "orange", "red"))(50),
+         fontsize_row = 7,
+         cellwidth = 20,
+         cellheight = 12)
+
+
+# ==== 2. BARPLOTS PRO KLASSE MIT LABELS ====
+plot_list_labeled <- list()
+
+for(class_i in 1:n_classes) {
+  # Berechne Importance
+  importance <- apply(abs(shap_all_classes[[class_i]]), 2, mean)
+  top_10 <- sort(importance, decreasing = TRUE)[1:10]
+  
+  # DataFrame mit Labels
+  df <- data.frame(
+    Feature_Original = names(top_10),
+    Feature_Label = rename_features(names(top_10)),
+    Importance = as.numeric(top_10)
+  )
+  
+  # Sortiere für Plot
+  df$Feature_Label <- factor(df$Feature_Label, 
+                             levels = rev(df$Feature_Label))
+  
+  plot_list_labeled[[class_i]] <- ggplot(df, aes(x = Feature_Label, y = Importance)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = paste("Klasse", class_i), x = "", y = "Mean |SHAP|") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 7))
+}
+
+# Kombiniere Plots
+library(patchwork)
+combined_barplots <- (plot_list_labeled[[1]] | plot_list_labeled[[2]] | plot_list_labeled[[3]]) /
+                     (plot_list_labeled[[4]] | plot_list_labeled[[5]] | plot_list_labeled[[6]]) /
+                     (plot_list_labeled[[7]] | plot_spacer() | plot_spacer())
+
+print(combined_barplots)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,"/shap_importance_per_class_labeled", 
+                     "_", target_var, ".png"),
+       width = 18, height = 12, dpi = 300, bg = "white")
+
+
+# ==== 3. GESTAPELTER BARPLOT MIT LABELS ====
+# Erstelle Long-Format für ggplot
+importance_long <- data.frame()
+
+for(class_i in 1:n_classes) {
+  importance <- apply(abs(shap_all_classes[[class_i]]), 2, mean)
+  importance_long <- rbind(importance_long, data.frame(
+    Feature = names(importance),
+    Klasse = paste0("Klasse_", class_i),
+    Importance = importance
+  ))
+}
+
+# Berechne Gesamt-Importance und nimm Top 15
+total_importance <- aggregate(Importance ~ Feature, data = importance_long, sum)
+top_15_features <- total_importance$Feature[order(total_importance$Importance, 
+                                                  decreasing = TRUE)[1:15]]
+top_10_features <- total_importance$Feature[order(total_importance$Importance, 
+                                                  decreasing = TRUE)[1:10]]
+
+# Filtere und füge Labels hinzu
+importance_long_top <- importance_long %>%
+  filter(Feature %in% top_10_features) %>%
+  mutate(Feature_Label = rename_features(Feature),
+         Feature_Label = factor(Feature_Label, 
+                               levels = rev(rename_features(top_10_features))))
+
+p_stacked <- ggplot(importance_long_top, 
+                   aes(x = Feature_Label, y = Importance, fill = Klasse)) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Spectral") +
+  labs(title = "SHAP: Feature Importance",
+       x = "", 
+       y = "Mittlere absolute SHAP-Werte (summiert)",
+       fill = "Klasse") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.y = element_text(size = 14))
+
+print(p_stacked)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,"/feature_importance_stacked_labeled", 
+                     "_", target_var, ".png"),
+       plot = p_stacked, 
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+
+# ==== 4. DEPENDENCE PLOTS MIT LABELS (Top 5) ====
+top_10_features_SHAP <- names(sort(mean_importance, decreasing = TRUE)[1:10])
+
+for(feat_idx in 1:10) {
+  top_feature <- top_10_features_SHAP[feat_idx]
+  top_feature_label <- rename_features(top_feature)
+  
+  cat("\nErstelle Dependence Plots für:", top_feature_label, "\n")
+  
+  # Bestimme Y-Grenzen
+  y_min <- Inf
+  y_max <- -Inf
+  
+  for(class_i in 1:n_classes) {
+    shap_vals <- shap_all_classes[[class_i]][, top_feature]
+    y_min <- min(y_min, shap_vals, na.rm = TRUE)
+    y_max <- max(y_max, shap_vals, na.rm = TRUE)
+  }
+  
+  y_range <- y_max - y_min
+  y_min <- y_min - 0.1 * y_range
+  y_max <- y_max + 0.1 * y_range
+  
+  # Erstelle Plots für alle Klassen
+  dep_plots <- list()
+  
+  for(class_i in 1:n_classes) {
+    plot_data <- data.frame(
+      feature_value = X_test[1:n_samples, top_feature],
+      shap_value = shap_all_classes[[class_i]][, top_feature]
+    )
+    
+    dep_plots[[class_i]] <- ggplot(plot_data, 
+                                   aes(x = feature_value, y = shap_value)) +
+      geom_point(alpha = 0.5, color = "steelblue", size = 2) +
+      geom_smooth(method = "loess", color = "red", se = FALSE, linewidth = 1.2) +
+      ylim(y_min, y_max) +
+      labs(x = top_feature_label, y = "SHAP value") +
+      ggtitle(paste("Klasse", class_i)) +
+      theme_minimal() +
+      theme(plot.title = element_text(size = 11, face = "bold"),
+            axis.title.x = element_text(size = 7))
+  }
+  
+  # Kombiniere alle
+  combined <- (dep_plots[[1]] | dep_plots[[2]] | dep_plots[[3]]) /
+              (dep_plots[[4]] | dep_plots[[5]] | dep_plots[[6]]) /
+              (dep_plots[[7]] | plot_spacer() | plot_spacer())
+  
+  combined <- combined + 
+    plot_annotation(
+      title = paste("SHAP Dependence Plot: Rang", feat_idx),
+      subtitle = top_feature_label,
+      theme = theme(plot.title = element_text(size = 16, face = "bold"),
+                   plot.subtitle = element_text(size = 14, color = "gray40"))
+    )
+  
+  print(combined)
+  
+  # Speichern
+  ggsave(filename = paste0("~/Masterthesis/plots/", target_var,"/shap_dependence_rank_labeled_10", feat_idx,
+                     "_", target_var, ".png"),
+    plot = combined,
+    width = 12, height = 12, dpi = 300, bg = "white"
+  )
+  
+  cat("✅ Gespeichert!\n")
+}
+
+cat("Diese Lösung arbeitet direkt mit den Original-SHAP-Matrizen.\n")
+
+# ==== VISUALISIERUNG TOP 10 VARIABLEN MULTINOMINAL ====
+
+# Erstelle Long-Format für gestapelten Plot
+coef_long <- data.frame()
+
+# Extrahiere Koeffizienten pro Klasse (Klasse 2-7, Klasse 1 ist Referenz)
+for(class_i in 1:(nrow(coef_multinom))) {
+  coef_long <- rbind(coef_long, data.frame(
+    Variable = names(top_10_multinom),
+    Klasse = paste0("Klasse_", class_i + 1),  # +1 weil Klasse 1 Referenz ist
+    Coefficient = abs(coef_multinom[class_i, names(top_10_multinom)])
+  ))
+}
+
+# Füge Labels hinzu
+coef_long$Variable_Label <- rename_features(coef_long$Variable)
+
+# Berechne Gesamt-Importance für Sortierung (wichtigste oben)
+total_coef <- aggregate(Coefficient ~ Variable_Label, data = coef_long, sum)
+coef_long$Variable_Label <- factor(coef_long$Variable_Label, 
+                                   levels = total_coef$Variable_Label[order(total_coef$Coefficient)])
+
+# Gestapelter Barplot
+p_multinom_stacked <- ggplot(coef_long, aes(x = Variable_Label, y = Coefficient, fill = Klasse)) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Spectral") +
+  labs(title = "Multinomiale Regression: Feature Importance",
+       x = "", 
+       y = "Absolute Koeffizienten (summiert)",
+       fill = "Klasse") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.y = element_text(size = 14))
+
+print(p_multinom_stacked)
+
+ggsave(filename = paste0("~/Masterthesis/plots/", target_var,"/multinomtop10_neu", "_", target_var, ".png"),
+    plot = p_multinom_stacked,
+    width = 10, height = 6, dpi = 300, bg = "white"
+  )
+cat("\n✅ Alle Visualisierungen mit Labels erfolgreich erstellt!\n")
+```
+
+Quellenangaben der verwendeten Packages:
+```{r}
+citation()
+cite_packages()
+```
+

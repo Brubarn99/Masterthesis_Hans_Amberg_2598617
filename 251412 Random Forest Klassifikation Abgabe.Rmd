@@ -1,0 +1,457 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Laden aller benötigten Bibliotheken:
+```{r setup}
+# ---- 1. PACKAGE-SETUP ----
+# Alle benötigten Bibliotheken laden
+suppressPackageStartupMessages({
+  library(haven)          # SPSS-Daten laden
+  library(tidyverse)      # Datenmanipulation und ggplot2
+  library(randomForest)   # Random Forest Modell
+  library(caret)          # Machine Learning Framework
+  library(corrplot)       # Korrelationsmatrizen
+  library(ranger)         # Schnellere Random Forest Implementation
+  library(nnet)
+library(glmnet)
+library(mltools)
+})
+
+cat("📦 Alle Pakete erfolgreich geladen!\n\n")
+```
+
+Laden des Datensatzes:
+```{r data_loading}
+# ---- 2. DATEN LADEN UND ERSTE EXPLORATION ----
+# SPSS-Datei laden
+data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/231121_Merged_CityFixed_MergeFixed.sav")
+
+cat("📊 Datensatz-Überblick:\n")
+cat(paste("Dimensionen:", nrow(data_raw), "Zeilen x", ncol(data_raw), "Spalten\n"))
+
+# Zielvariable definieren
+target_var <- "q5_10"  # Zielvariable
+
+cat("\n🎯 Zielvariable Analyse:\n")
+print(table(data_raw[[target_var]], useNA = "ifany"))
+cat("Bereich:", min(data_raw[[target_var]], na.rm=TRUE), "bis", 
+    max(data_raw[[target_var]], na.rm=TRUE), "\n")
+```
+Konvertierung der Daten und Entfernung aller Zeilen mit fehlender Zielvariable, Überprüfung fehlender Daten:
+```{r data_cleaning}
+# ---- 3. DATENBEREINIGUNG UND -AUFBEREITUNG ----
+data_clean <- data_raw %>%
+  # Entferne Zeilen mit fehlender Zielvariable
+  filter(!is.na(.data[[target_var]])) %>%
+  # Konvertiere SPSS Labels zu numerischen Werten (nur für nicht-character Variablen)
+  mutate(across(where(is.labelled) & !where(is.character), ~ as.numeric(.x))) %>%
+  # Für character-labelled Variablen: Entferne Labels und behalte als character
+  mutate(across(where(is.labelled) & where(is.character), ~ as.character(.x)))
+
+cat("\n🧹 Nach Bereinigung:", nrow(data_clean), "Zeilen verbleibend\n")
+
+# Entferne Spalten  mit nur NAs
+data_clean <- data_clean[, colSums(is.na(data_clean)) < nrow(data_clean)]
+
+# Missing Values Analyse
+missing_summary <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Percent = round((Missing_Count / nrow(data_clean)) * 100, 2)) %>%
+  arrange(desc(Missing_Count))
+
+# Visualisierung der Missing Values (nur wenn welche vorhanden)
+if(sum(missing_summary$Missing_Count) > 0) {
+  p_missing <- missing_summary %>%
+    head(20) %>%
+    filter(Missing_Count > 0) %>%
+    ggplot(aes(x = reorder(Variable, Missing_Count), y = Missing_Percent)) +
+    geom_col(fill = "coral") +
+    coord_flip() +
+    labs(title = "Missing Values Analyse (Top 20)",
+         x = "Variable", y = "Fehlende Werte (%)") +
+    theme_minimal()
+  
+  print(p_missing)
+}
+```
+Definition und Überprüfung der betrachteten Prädiktorvariablen:
+```{r basic_feature_selection}
+# ---- 4. FEATURE-AUSWAHL MIT INCLUDE-LISTE ----
+
+# Definiere ALLE gewünschten Features (ohne Zielvariable)
+include_vars <- c(
+  # Ökologische Faktoren:
+  "a1l1_333", "a1l2_334", "a1l3_335", "a1l4_336", "a1l5_337",
+  
+  # Soziale Faktoren:
+  "a2l1_338", "a2l2_339", "a2l3_340", "a2l4_341", "a2l5_342",
+  
+  # Ökonomische Faktoren:
+  "a3l1_343", "a3l2_344", "a3l3_345", "a3l4_346", "a3l5_347", "a3l6_348",
+  
+  # Demografische Variablen
+  "Age", "FamilySt", "FamilyPrsNr", 
+  "FamilyChldNr_SQ002", "FamilyChldNr_SQ003", "FamilyChldNr_SQ004", 
+  "FamilyChldNr_SQ005", "FamilyChldNr_SQ006", "FamilyChldNr_SQ007",
+  
+  # Bildung & Beruf
+  "EduSD", "Occup", "Office",
+  
+  # Big Five Persönlichkeit
+  "SklBig5_G1", "SklBig5_E1", "SklBig5_O1", "SklBig5_N1", "SklBig5_V1",
+  "SklBig5_E2", "SklBig5_N2", "SklBig5_G2", "SklBig5_V2", "SklBig5_O2",
+  
+  # Einkommen & Ausgaben
+  "NetIncome", "NetIncomeFree_ResiRnt", "NetIncomeFree_consumption", 
+  "NetIncomeFree_savings",
+  
+  # Ausgabenkategorien
+  "Spendings_NonFood", "Spendings_Sport", "Spendings_BodyCare", 
+  "Spendings_Leissure", "Spendings_VocTrng", "Spendings_PrvtTrng",
+  "Spendings_EDU", "Spendings_Gastro", "Spendings_Culture"
+)
+
+cat("\n🎯 Feature-Auswahl mit Include-Liste:\n")
+cat("Gewünschte Features:", length(include_vars), "\n\n")
+
+# PRÜFUNG 1: Welche Variablen existieren im Datensatz?
+existing_vars <- intersect(include_vars, names(data_clean))
+missing_vars <- setdiff(include_vars, names(data_clean))
+
+cat("✅ Existierende Features:", length(existing_vars), "\n")
+
+if(length(missing_vars) > 0) {
+  cat("\n⚠️ Fehlende Features (", length(missing_vars), "):\n", sep="")
+  print(missing_vars)
+  cat("\nDiese werden ignoriert.\n")
+}
+
+# PRÜFUNG 2: Sind alle numerisch?
+non_numeric <- existing_vars[!sapply(data_clean[existing_vars], is.numeric)]
+if(length(non_numeric) > 0) {
+  cat("\n⚠️ Nicht-numerische Features (", length(non_numeric), "):\n", sep="")
+  print(non_numeric)
+  cat("Diese werden entfernt.\n")
+  existing_vars <- setdiff(existing_vars, non_numeric)
+}
+
+# Finalisiere Feature-Liste
+feature_cols <- existing_vars
+cat("\n✅ Finale Feature-Anzahl:", length(feature_cols), "\n")
+
+# Erstelle Basis-Datensatz (Features + Zielvariable)
+data_basic <- data_clean %>%
+  select(all_of(c(feature_cols, target_var)))
+
+# PRÜFUNG 3: Entferne Spalten mit Standardabweichung = 0
+zero_sd_cols <- names(which(apply(data_basic[feature_cols], 2, 
+                                   function(x) sd(x, na.rm = TRUE)) == 0))
+if(length(zero_sd_cols) > 0) {
+  cat("\n⚠️ Entferne", length(zero_sd_cols), "Features mit SD=0:\n")
+  print(zero_sd_cols)
+  feature_cols <- setdiff(feature_cols, zero_sd_cols)
+  data_basic <- data_basic %>% select(all_of(c(feature_cols, target_var)))
+}
+
+# PRÜFUNG 4: Warnung bei hohen Missing Values
+missing_pct <- colMeans(is.na(data_basic[feature_cols])) * 100
+high_missing <- names(missing_pct[missing_pct > 50])
+
+if(length(high_missing) > 0) {
+  cat("\n⚠️ Features mit >50% Missing Values (", length(high_missing), "):\n", sep="")
+  high_missing_df <- data.frame(
+    Feature = high_missing,
+    Missing_Pct = round(missing_pct[high_missing], 1)
+  )
+  print(high_missing_df)
+  cat("\nHinweis: Diese werden NICHT automatisch entfernt,\n")
+  cat("aber könnten die Modellqualität beeinträchtigen.\n")
+}
+
+# AUSGABE: Zusammenfassung
+cat("\n" , rep("=", 70), "\n", sep="")
+cat("FEATURE-AUSWAHL ABGESCHLOSSEN\n")
+cat(rep("=", 70), "\n\n", sep="")
+cat("Datensatz-Dimensionen:", nrow(data_basic), "Zeilen x", ncol(data_basic), "Spalten\n")
+cat("- Features:", length(feature_cols), "\n")
+cat("- Zielvariable: 1 (", target_var, ")\n", sep="")
+cat("- Gesamt Missing Rate:", round(mean(is.na(data_basic)) * 100, 2), "%\n")
+```
+Korrelations- und Zielwertanalyse:
+```{r eda}
+# ---- 5. EXPLORATIVE DATENANALYSE (EDA) ----
+cat("\n📈 Explorative Datenanalyse...\n")
+
+# Verteilung der Zielvariable
+p_target <- ggplot(data_basic, aes_string(x = target_var)) +
+  geom_histogram(bins = 7, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_density(aes(y = ..count..), alpha = 0.3, fill = "red") +
+  labs(title = paste("Verteilung der Zielvariable:", target_var),
+       x = "Likert-Skala (1-7)", y = "Häufigkeit") +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:7)
+
+print(p_target)
+
+# Einfache Imputation mit Median für Korrelationsanalyse
+data_for_corr <- data_basic
+for(col in feature_cols) {
+  if(sum(is.na(data_for_corr[[col]])) > 0) {
+    data_for_corr[[col]][is.na(data_for_corr[[col]])] <- median(data_for_corr[[col]], na.rm = TRUE)
+  }
+}
+
+# Korrelationsanalyse für Top Features
+feature_data <- data_for_corr %>%
+  select(-all_of(target_var))
+
+# Berechne Korrelationen zur Zielvariable
+correlations <- cor(feature_data, data_for_corr[[target_var]], use = "complete.obs")
+correlations <- abs(as.vector(correlations))
+names(correlations) <- colnames(feature_data) 
+correlations <- sort(correlations, decreasing = TRUE)
+
+# Top Features für Korrelationsmatrix
+top_features <- names(correlations)[1:min(20, length(correlations))]
+
+# Korrelationsmatrix plotten
+cor_matrix <- cor(data_for_corr[c(top_features, target_var)], use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.8, tl.col = "black", title = "Korrelationsmatrix (Top Features)")
+
+# Ausgabe der Korrelationen mit Zielvariable
+cor_target <- cor_matrix[target_var, ] %>% sort(decreasing = TRUE)
+cat("\nTop 10 Korrelationen mit Zielvariable:\n")
+print(head(cor_target, 20))
+```
+
+Train-Test-Split, Imputation mithilfe des Random Forests:
+```{r imputing}
+# Train-Test Split
+set.seed(42)
+trainIndex <- createDataPartition(data_basic[[target_var]], p = 0.7, list = FALSE)
+train_basic <- data_basic[trainIndex, ]
+test_basic <- data_basic[-trainIndex, ]
+
+cat("Training:", nrow(train_basic), "Beobachtungen\n")
+cat("Test:", nrow(test_basic), "Beobachtungen\n")
+
+# Fehlende Werte schätzen und Random Forest trainieren
+# rfImpute führt eine Iteration von Imputation und Modelltraining durch
+# Bereinige den Datensatz, um nur die Features und die Zielvariable zu behalten
+data_for_imputation <- as.data.frame(train_basic) %>%
+  select(all_of(feature_cols), all_of(target_var))
+data_for_imputation_test <- as.data.frame(test_basic) %>%
+  select(all_of(feature_cols), all_of(target_var))
+
+# Prüfe Missing Values
+missing_count <- sum(is.na(data_for_imputation))
+cat("Fehlende Werte im Datensatz:", missing_count, "\n")
+missing_count_test <- sum(is.na(data_for_imputation_test))
+cat("Fehlende Werte im Test-Datensatz:", missing_count_test, "\n")
+
+  # rfImpute für die Feature-Matrix (ohne Zielvariable)
+  X_imputed <- rfImpute(
+    x = data_for_imputation[feature_cols],
+    y = data_for_imputation[[target_var]],
+    iter = 5,
+    ntree = 1000
+  )
+  
+  # Kombiniere imputierte Features mit Zielvariable
+  data_imputed <- data.frame(
+    X_imputed,
+    target = data_for_imputation[[target_var]]
+  )
+  names(data_imputed)[ncol(data_imputed)] <- target_var
+  
+data_imputed[[target_var]] <- factor(data_imputed[[target_var]], levels = 1:7)
+  
+  # Jetzt Random Forest auf imputierten Daten trainieren
+  rf_imputed <- randomForest(
+    x = data_imputed[feature_cols],
+    y = data_imputed[[target_var]],
+    iter = 5,
+    ntree = 1000,
+    importance = TRUE
+  )
+  
+# Für den Test-Datensatz:
+  
+ # rfImpute für die Feature-Matrix (ohne Zielvariable)
+  X_imputed_test <- rfImpute(
+    x = data_for_imputation_test[feature_cols],
+    y = data_for_imputation_test[[target_var]],
+    iter = 5,
+    ntree = 1000
+  )
+  
+  # Kombiniere imputierte Features mit Zielvariable
+  data_imputed_test <- data.frame(
+    X_imputed_test,
+    target = data_for_imputation_test[[target_var]]
+  )
+  names(data_imputed_test)[ncol(data_imputed_test)] <- target_var
+  
+  # Jetzt Random Forest auf imputierten Daten trainieren
+  rf_imputed_test <- randomForest(
+    x = data_imputed_test[feature_cols],
+    y = data_imputed_test[[target_var]],
+    ntree = 1000,
+    importance = TRUE
+  )
+
+# Feature Importance extrahieren
+# Die Wichtigkeitswerte sind im rf_imputed-Objekt gespeichert
+importance_df <- data.frame(
+  Variable = names(rf_imputed$importance[, 1]),
+  Importance = rf_imputed$importance[, 1]
+) %>%
+  arrange(desc(Importance))
+
+cat("✅ Imputation und Random Forest Modell erfolgreich trainiert.\n")
+
+print(head(importance_df, 10))
+```
+
+Training des Random Forests auf den imputierten Daten inkl. Hyperparameteroptimierung:
+```{r initial_xgb_training}
+# Hyperparameter Grid
+param_grid <- expand.grid(
+  mtry = c(
+    floor(sqrt(length(feature_cols))),
+    floor(length(feature_cols)/3),
+    floor(length(feature_cols)/2),
+    floor(length(feature_cols) * 0.8)
+  ),
+  splitrule = c("variance", "extratrees"),
+  min.node.size = c(5, 10, 20)
+)
+
+# Cross-Validation Setup
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+cat("Starte Hyperparameter-Tuning mit", nrow(param_grid), "Kombinationen...\n")
+cat("Features verwendet:", length(feature_cols), "\n")
+
+# Training mit erweiterten Features
+rf_enhanced <- train(
+  x = data_imputed[feature_cols], #enhanced_train
+  y = data_imputed[[target_var]],
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = param_grid,
+  num.trees = 1000,
+  importance = "impurity",
+  respect.unordered.factors = "order"
+)
+
+cat("✅ Enhanced Random Forest trainiert!\n")
+print(rf_enhanced$bestTune)
+
+```
+
+ 
+Berechnung der Gütemaße des Modells:
+```{r}
+# ----- Gütemaße -----
+X_test_matrix <- as.matrix(test_basic[feature_cols])
+X_test_data <- test_basic[feature_cols]
+
+# Vorhersage gibt Matrix mit Wahrscheinlichkeiten zurück
+predict <- predict(rf_enhanced, X_test_matrix, reshape = TRUE)
+
+# Extrahiere die Klasse mit höchster Wahrscheinlichkeit
+predict_class <- predict(rf_enhanced, newdata = X_test_data)  # Gibt Spaltenindex (1-7) zurück
+
+# Konvertiere zu Faktoren
+y_true_xgb <- factor(test_basic[[target_var]], levels = 1:7)
+y_pred_xgb <- factor(predict_class, levels = 1:7)
+
+# Confusion Matrix
+conf_matrix_xgb <- confusionMatrix(y_pred_xgb, y_true_xgb)
+print(conf_matrix_xgb$table)
+
+accuracy_xgb <- mean(predict_class == test_basic[[target_var]])
+cat("Accuracy:", round(accuracy_xgb, 4), "\n")
+
+# Plot
+plot(test_basic[[target_var]], predict_class,
+    xlab = "Tatsächliche Klassen",
+    ylab = "Vorhergesagte Klassen",
+    main = "Random_Forest Klassifikation: Vorhersage vs. Realität")
+abline(0, 1, col = "red", lwd = 2)
+
+# Nach der Random_Forest Confusion Matrix
+
+
+# Berechne MCC für Random_Forest
+mcc_xgb <- mcc(preds = y_pred_xgb, actuals = y_true_xgb)
+cat("\nMCC des Random_Forest Modells:", round(mcc_xgb, 4), "\n")
+
+# Balanced Accuracy
+sensitivities_xgb <- conf_matrix_xgb$byClass[, "Sensitivity"]
+ba_xgb <- mean(sensitivities_xgb, na.rm = TRUE)
+cat("\nBalanced Accuracy des Random_Forest Modells:", round(ba_xgb, 4), "\n")
+
+# Berechne F1-Score pro Klasse
+f1_scores_xgb <- conf_matrix_xgb$byClass[, "F1"]
+# Macro-averaged F1-Score (Durchschnitt über alle Klassen)
+f1_macro_xgb <- mean(f1_scores_xgb, na.rm = TRUE)
+cat("Macro F1-Score des Random_Forest Modells:", round(f1_macro_xgb, 4), "\n\n")
+
+
+### Multinomiale Logistische Regression ###
+train_imputed <- train_basic[feature_cols]
+train_imputed[is.na(train_imputed)] <- 4
+
+multinom_model <- multinom(as.factor(train_basic[[target_var]]) ~ .,
+                          data = train_imputed)
+
+# Test-Daten auch imputiert
+test_imputed <- test_basic[feature_cols]
+test_imputed[is.na(test_imputed)] <- 4
+
+predict_multinom <- predict(multinom_model, test_imputed)
+accuracy_multinom_imputed <- mean(predict_multinom == as.factor(test_basic[[target_var]]))
+cat("Accuracy des multinomialen Modells:", round(accuracy_multinom_imputed, 4), "\n")
+
+# Konvertiere zu Faktoren mit gleichen Levels
+y_true <- factor(test_basic[[target_var]], levels = 1:7)  # Korrektur: test_basic statt test_imputed
+y_pred <- factor(predict_multinom, levels = 1:7)
+
+# Berechne MCC
+mcc_multinom <- mcc(preds = y_pred, actuals = y_true)
+cat("MCC des multinomialen Modells:", round(mcc_multinom, 4), "\n\n")
+
+# Erstelle Confusion Matrix
+conf_matrix_multinom <- confusionMatrix(y_pred, y_true)
+print(conf_matrix_multinom$table)
+
+# Extrahiere Sensitivity (Recall) pro Klasse
+sensitivities <- conf_matrix_multinom$byClass[, "Sensitivity"]
+
+# Balanced Accuracy = Durchschnitt der Sensitivities
+ba_multinom <- mean(sensitivities, na.rm = TRUE)
+cat("Balanced Accuracy des multinominalen Modells:", round(ba_multinom, 4), "\n\n")
+
+# F1-Score für imputiertes multinomiales Modell
+f1_scores_multinom <- conf_matrix_multinom$byClass[, "F1"]
+# Macro-averaged F1-Score
+f1_macro_multinom <- mean(f1_scores_multinom, na.rm = TRUE)
+cat("Macro F1-Score des multinomialen Modells (imputiert):", round(f1_macro_multinom, 4), "\n\n")
+```
+
+Quellenangaben der verwendeten Packages:
+```{r}
+citation()
+cite_packages()
+```

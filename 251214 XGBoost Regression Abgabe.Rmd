@@ -1,0 +1,332 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Laden aller benötigten Bibliotheken:
+```{r setup}
+# ---- 1. PACKAGE-SETUP ----
+# Alle benötigten Bibliotheken laden
+suppressPackageStartupMessages({
+  library(haven)          # SPSS-Daten laden
+  library(tidyverse)      # Datenmanipulation und ggplot2
+  library(caret)          # Machine Learning Framework
+  library(corrplot)       # Korrelationsmatrizen
+  library(xgboost)        # XGBoost Modell
+  library(reshape2)       # Für Violin Plot
+  library(pheatmap)       # Für heatmap
+  library(glmnet)         # Für Hyperparametrisierung
+  library(report)         # Für die Quellenangaben am Ende
+})
+
+cat("📦 Alle Pakete erfolgreich geladen!\n\n")
+```
+
+Laden des Datensatzes:
+```{r data_loading}
+# ---- 2. DATEN LADEN UND ERSTE EXPLORATION ----
+# SPSS-Datei laden
+# data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/data_subset.sav")
+
+data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/231121_Merged_CityFixed_MergeFixed.sav")
+
+cat("📊 Datensatz-Überblick:\n")
+cat(paste("Dimensionen:", nrow(data_raw), "Zeilen x", ncol(data_raw), "Spalten\n"))
+
+# Zielvariable definieren
+target_var <- "q5_10"  # q6_11 oder q4_9
+
+cat("\n🎯 Zielvariable Analyse:\n")
+print(table(data_raw[[target_var]], useNA = "ifany"))
+cat("Bereich:", min(data_raw[[target_var]], na.rm=TRUE), "bis", 
+    max(data_raw[[target_var]], na.rm=TRUE), "\n")
+```
+Konvertierung der Daten und Entfernung aller Zeilen mit fehlender Zielvariable:
+```{r data_cleaning}
+# ---- 3. DATENBEREINIGUNG UND -AUFBEREITUNG ----
+data_clean <- data_raw %>%
+  # Entferne Zeilen mit fehlender Zielvariable
+  filter(!is.na(.data[[target_var]])) %>%
+  # Konvertiere SPSS Labels zu numerischen Werten
+  mutate(across(where(is.labelled) & !where(is.character), ~ as.numeric(.x)))
+
+cat("\n Nach Bereinigung:", nrow(data_clean), "Zeilen verbleibend\n")
+
+```
+Definition und Überprüfung der betrachteten Prädiktorvariablen:
+```{r basic_feature_selection}
+# Definiere ALLE gewünschten Features (ohne Zielvariable)
+include_vars <- c(
+  # Ökologische Faktoren:
+  "a1l1_333", "a1l2_334", "a1l3_335", "a1l4_336", "a1l5_337",
+  
+  # Soziale Faktoren:
+  "a2l1_338", "a2l2_339", "a2l3_340", "a2l4_341", "a2l5_342",
+  
+  # Ökonomische Faktoren:
+  "a3l1_343", "a3l2_344", "a3l3_345", "a3l4_346", "a3l5_347", "a3l6_348",
+  
+  # Demografische Variablen
+  "Age", "FamilySt", "FamilyPrsNr", 
+  "FamilyChldNr_SQ002", "FamilyChldNr_SQ003", "FamilyChldNr_SQ004", 
+  "FamilyChldNr_SQ005", "FamilyChldNr_SQ006", "FamilyChldNr_SQ007",
+  
+  # Bildung & Beruf
+  "EduSD", "Occup", "Office",
+  
+  # Big Five Persönlichkeit
+  "SklBig5_G1", "SklBig5_E1", "SklBig5_O1", "SklBig5_N1", "SklBig5_V1",
+  "SklBig5_E2", "SklBig5_N2", "SklBig5_G2", "SklBig5_V2", "SklBig5_O2",
+  
+  # Einkommen & Ausgaben
+  "NetIncome", "NetIncomeFree_ResiRnt", "NetIncomeFree_consumption", 
+  "NetIncomeFree_savings",
+  
+  # Ausgabenkategorien
+  "Spendings_NonFood", "Spendings_Sport", "Spendings_BodyCare", 
+  "Spendings_Leissure", "Spendings_VocTrng", "Spendings_PrvtTrng",
+  "Spendings_EDU", "Spendings_Gastro", "Spendings_Culture"
+)
+
+cat("\n🎯 Feature-Auswahl mit Include-Liste:\n")
+cat("Gewünschte Features:", length(include_vars), "\n\n")
+
+# PRÜFUNG 1: Welche Variablen existieren im Datensatz?
+existing_vars <- intersect(include_vars, names(data_clean))
+missing_vars <- setdiff(include_vars, names(data_clean))
+
+cat("✅ Existierende Features:", length(existing_vars), "\n")
+
+if(length(missing_vars) > 0) {
+  cat("\n⚠️ Fehlende Features (", length(missing_vars), "):\n", sep="")
+  print(missing_vars)
+  cat("\nDiese werden ignoriert.\n")
+}
+
+# PRÜFUNG 2: Sind alle numerisch?
+non_numeric <- existing_vars[!sapply(data_clean[existing_vars], is.numeric)]
+if(length(non_numeric) > 0) {
+  cat("\n⚠️ Nicht-numerische Features (", length(non_numeric), "):\n", sep="")
+  print(non_numeric)
+  cat("Diese werden entfernt.\n")
+  existing_vars <- setdiff(existing_vars, non_numeric)
+}
+
+# Finalisiere Feature-Liste
+feature_cols <- existing_vars
+cat("\n✅ Finale Feature-Anzahl:", length(feature_cols), "\n")
+
+# Erstelle Basis-Datensatz (Features + Zielvariable)
+data_basic <- data_clean %>%
+  select(all_of(c(feature_cols, target_var)))
+
+# PRÜFUNG 3: Entferne Spalten mit Standardabweichung = 0
+zero_sd_cols <- names(which(apply(data_basic[feature_cols], 2, 
+                                   function(x) sd(x, na.rm = TRUE)) == 0))
+if(length(zero_sd_cols) > 0) {
+  cat("\n⚠️ Entferne", length(zero_sd_cols), "Features mit SD=0:\n")
+  print(zero_sd_cols)
+  feature_cols <- setdiff(feature_cols, zero_sd_cols)
+  data_basic <- data_basic %>% select(all_of(c(feature_cols, target_var)))
+}
+
+# PRÜFUNG 4: Warnung bei hohen Missing Values
+missing_pct <- colMeans(is.na(data_basic[feature_cols])) * 100
+high_missing <- names(missing_pct[missing_pct > 50])
+
+if(length(high_missing) > 0) {
+  cat("\n⚠️ Features mit >50% Missing Values (", length(high_missing), "):\n", sep="")
+  high_missing_df <- data.frame(
+    Feature = high_missing,
+    Missing_Pct = round(missing_pct[high_missing], 1)
+  )
+  print(high_missing_df)
+  cat("\nHinweis: Diese werden NICHT automatisch entfernt,\n")
+  cat("aber könnten die Modellqualität beeinträchtigen.\n")
+}
+
+# AUSGABE: Zusammenfassung
+cat("\n" , rep("=", 70), "\n", sep="")
+cat("FEATURE-AUSWAHL ABGESCHLOSSEN\n")
+cat(rep("=", 70), "\n\n", sep="")
+cat("Datensatz-Dimensionen:", nrow(data_basic), "Zeilen x", ncol(data_basic), "Spalten\n")
+cat("- Features:", length(feature_cols), "\n")
+cat("- Zielvariable: 1 (", target_var, ")\n", sep="")
+cat("- Gesamt Missing Rate:", round(mean(is.na(data_basic)) * 100, 2), "%\n")
+```
+
+
+```{r basic_feature_selection_alt}
+
+# Korrelationsberechnung
+feature_data <- data_basic %>%
+  select(-all_of(target_var))
+
+correlations <- cor(feature_data, data_basic[[target_var]], use = "complete.obs")
+correlations <- abs(as.vector(correlations))
+names(correlations) <- colnames(feature_data) 
+correlations <- sort(correlations, decreasing = TRUE)
+
+# Top Features für Korrelationsmatrix
+top_features <- names(correlations)[1:min(20, length(correlations))]
+
+# Korrelationsmatrix plotten
+cor_matrix <- cor(data_basic[c(top_features, target_var)], use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.8, tl.col = "black", title = "Korrelationsmatrix (Top Features)")
+
+# Korrelationen mit Zielvariable
+cor_target <- cor_matrix[target_var, ] %>% sort(decreasing = TRUE)
+head(cor_target, 10)
+```
+
+Auswahl der Features nach Höhe der Korrelation:
+```{r Korrelation_feature_selection}
+# # Top Features nach Korrelation zur Zielvariable auswählen
+# high_corr_features <- names(correlations)[1:20]  # Top 20 Features
+# feature_cols <- high_corr_features  # Überschreibt die bisherige Auswahl
+# 
+# cat("Korrelationsbasierte Feature-Auswahl:\n")
+# cat("Anzahl Features nach Korrelation:", length(feature_cols), "\n")
+# 
+# # Erstelle Basis-Datensatz
+# data_basic <- data_clean %>%
+#   select(all_of(c(feature_cols, target_var)))
+# 
+# cat("Basis-Datensatz:", nrow(data_basic), "Zeilen x", ncol(data_basic), "Spalten\n")
+```
+Verteilung der Zielvariable:
+```{r eda}
+# ---- 5. EXPLORATIVE DATENANALYSE (EDA) ----
+cat("\n📈 Explorative Datenanalyse...\n")
+
+# Verteilung der Zielvariable
+p_target <- ggplot(data_basic, aes_string(x = target_var)) +
+  geom_histogram(bins = 7, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_density(aes(y = ..count..), alpha = 0.3, fill = "red") +
+  labs(title = paste("Verteilung der Zielvariable:", target_var),
+       x = "Likert-Skala (1-7)", y = "Häufigkeit") +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:7)
+
+print(p_target)
+
+```
+Train-Test-Split und Selektierung der gewünschten Datenspalten:
+```{r}
+# ---- 6. ERSTES XGBOOST TRAINING (für Feature Importance) ----
+cat("\n🚀 Erstes XGBoost Training für Feature Importance...\n")
+
+data_imputed <- as.data.frame(data_basic) %>%
+  select(all_of(feature_cols), all_of(target_var))
+
+# Train-Test Split
+set.seed(42)
+trainIndex <- createDataPartition(data_imputed[[target_var]], p = 0.7, list = FALSE)
+train_basic <- data_imputed[trainIndex, ]
+test_basic <- data_imputed[-trainIndex, ]
+```
+
+Training des XGBoost-Modells:
+```{r initial_xgb_training}
+# XGBoost benötigt numerische Matrix
+X_train_matrix <- as.matrix(train_basic[feature_cols])
+y_train_vector <- train_basic[[target_var]]
+
+# Hyperoptimierung
+# Parameter-Grid für XGBoost
+xgb_grid <- expand.grid(
+  nrounds = c(100,300, 500), 
+  max_depth = c(3, 6, 9), 
+  eta = c(0.01, 0.1, 0.3), 
+  gamma = 0,
+  colsample_bytree =  c(0.6, 0.8, 1.0), 
+  min_child_weight = 1,
+  subsample = c(0.7, 1.0) 
+)
+
+# Optimum: 300 3	0.01	0	0.6	1	1
+
+# Cross-Validation Setup
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE
+)
+
+# Hyperparameter-Tuning
+xgb_tuned <- train(
+  x = X_train_matrix,
+  y = y_train_vector,
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = xgb_grid,
+  metric = "RMSE"
+)
+
+print(xgb_tuned$bestTune)
+xgb_model <- xgb_tuned$finalModel
+
+
+cat("✅ XGBoost Modell erfolgreich trainiert.\n")
+```
+
+
+Gütemaße von XGBoost: 
+
+```{r}
+### XGBoost ###
+X_test_matrix <- as.matrix(test_basic[feature_cols])
+predict <- predict(xgb_model, X_test_matrix)
+
+# Metriken-Berechnung
+MAE <- mean(abs(predict - test_basic[[target_var]]))
+MSE <- (mean((predict - test_basic[[target_var]])^2))
+RMSE <- sqrt(MSE)
+
+# R² Berechnung
+ss_res <- sum((test_basic[[target_var]] - predict)^2)
+ss_tot <- sum((test_basic[[target_var]] - mean(test_basic[[target_var]]))^2)
+R2 <- 1 - (ss_res / ss_tot)
+
+# Plot
+plot(test_basic[[target_var]], predict,
+    xlab = "Tatsächliche Werte",
+    ylab = "Vorhergesagte Werte",
+    main = "XGBoost Regression: Vorhersage vs. Realität")
+abline(0, 1, col = "red", lwd = 2)
+
+y_test <- test_basic[[target_var]]
+
+xgb_ergebnis <- ggplot(data.frame(Actual = y_test, Predicted = predict), 
+                      aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linewidth = 1) +
+  xlim(1, 7) +
+  ylim(1, 7) +
+  coord_fixed(ratio = 1) +  
+  labs(x = "Tatsächliche Werte",
+       y = "Vorhergesagte Werte",
+       title = "XGBoost: Regression") +
+  theme_minimal()
+
+print(xgb_ergebnis)
+
+ggsave(filename = paste0("~/Masterthesis/plots/XGBoost/Regression", 
+                     "_", target_var, ".png"), 
+       plot = xgb_ergebnis, 
+       width = 8, height = 6, dpi = 300, bg = "white")
+
+cat("R² des Modells:", R2, "\n")
+cat("MSE des Modells:", MSE, "\n")
+cat("MAE des Modells:", MAE, "\n")
+cat("RMSE des Modells:", RMSE, "\n")
+
+```
+
+
+Quellenangaben der verwendeten Packages:
+```{r}
+citation()
+cite_packages()
+```
