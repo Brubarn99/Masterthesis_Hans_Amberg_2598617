@@ -5,7 +5,7 @@ output: html_notebook
 ---
 Laden der benötigten Packages:
 ```{r setup}
-# ---- 1. PACKAGE-SETUP ----
+# ---- PACKAGE-SETUP ----
 # Alle benötigten Bibliotheken laden
 suppressPackageStartupMessages({
   library(haven)          # SPSS-Daten laden
@@ -24,7 +24,7 @@ cat("📦 Alle Pakete erfolgreich geladen!\n\n")
 
 Laden der Daten:
 ```{r data_loading}
-# ---- 2. DATEN LADEN UND ERSTE EXPLORATION ----
+# ---- DATEN LADEN UND ERSTE EXPLORATION ----
 # SPSS-Datei laden
 data_raw <- read_sav("~/Masterthesis/Datensatz Innenstadt/231121_Merged_CityFixed_MergeFixed.sav")
 
@@ -41,7 +41,7 @@ cat("Bereich:", min(data_raw[[target_var]], na.rm=TRUE), "bis",
 ```
 Entfernen von Zeilen, bei denen die Zielvariable fehlt:
 ```{r data_cleaning}
-# ---- 3. DATENBEREINIGUNG UND -AUFBEREITUNG ----
+# ---- DATENBEREINIGUNG UND -AUFBEREITUNG ----
 data_clean <- data_raw %>%
   # Entferne Zeilen mit fehlender Zielvariable
   filter(!is.na(.data[[target_var]])) %>%
@@ -53,7 +53,7 @@ cat("\n🧹 Nach Bereinigung:", nrow(data_clean), "Zeilen verbleibend\n")
 ```
 Definition und Überprüfung der betrachteten Prädiktorvariablen:
 ```{r basic_feature_selection}
-# ---- 4. BASIS FEATURE-AUSWAHL ----
+# ---- BASIS FEATURE-AUSWAHL ----
 # Definiere ALLE gewünschten Features (ohne Zielvariable)
 include_vars <- c(
   # Ökologische Faktoren:
@@ -131,7 +131,7 @@ if(length(zero_sd_cols) > 0) {
 ```
 Verteilung der Zielvariable und Berechnung Korrelationen:
 ```{r eda}
-# ---- 5. EXPLORATIVE DATENANALYSE (EDA) ----
+# ---- EXPLORATIVE DATENANALYSE (EDA) ----
 cat("\n📈 Explorative Datenanalyse...\n")
 
 # Verteilung der Zielvariable
@@ -165,7 +165,7 @@ corrplot(cor_matrix, method = "color", type = "upper",
 ```
 Train-Test-Split, Imputation mithilfe des Random Forests: 
 ```{r initial_rf_training}
-# ---- 6. ERSTES RANDOM FOREST TRAINING (für Feature Importance) ----
+# ---- RANDOM FOREST TRAINING (für Feature Importance) ----
 cat("\n🌲 Erstes Random Forest Training für Feature Importance...\n")
 
 # Train-Test Split
@@ -237,7 +237,7 @@ cat("✅ Imputation und Random Forest Modell erfolgreich trainiert.\n")
 
 Training des Random Forests auf den imputierten Daten inkl. Hyperparameteroptimierung:
 ```{r enhanced_rf_training}
-# ---- 9. RANDOM FOREST MIT HYPERPARAMETER TUNING ----
+# ---- RANDOM FOREST MIT HYPERPARAMETER TUNING ----
 cat("\n RANDOM FOREST TRAINING\n")
 
 # Hyperparameter Grid
@@ -401,3 +401,4 @@ Quellenangaben der verwendeten Packages:
 citation()
 cite_packages()
 ```
+
